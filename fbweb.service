@@ -1,0 +1,17 @@
+[Unit]
+Description=FBWeb - FreeBASIC Web-IDE
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fbweb
+Environment=FBWEB_CONFIG=/opt/fbweb/config.yaml
+ExecStart=/opt/fbweb/venv/bin/python /opt/fbweb/app.py
+Restart=on-failure
+RestartSec=3
+# Laufende FreeBASIC-Programme beim Stoppen mit beenden
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

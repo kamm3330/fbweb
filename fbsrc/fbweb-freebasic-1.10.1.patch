@@ -1,0 +1,607 @@
+diff -ruN a/src/gfxlib2/unix/gfx_driver_fbweb.c b/src/gfxlib2/unix/gfx_driver_fbweb.c
+--- a/src/gfxlib2/unix/gfx_driver_fbweb.c	1970-01-01 01:00:00.000000000 +0100
++++ b/src/gfxlib2/unix/gfx_driver_fbweb.c	2026-11-13 20:47:56.043531522 +0100
+@@ -0,0 +1,526 @@
++/* FBWeb gfx driver
++ *
++ * Streams the gfxlib2 framebuffer over an inherited socket to the FBWeb server
++ * (which forwards it to a browser <canvas>) and receives keyboard/mouse input
++ * from it.  Active only if the environment variable FBWEB_GFX_FD names an open
++ * socket file descriptor; otherwise init fails and gfxlib2 falls back to the
++ * next driver (X11, fbdev, ...).
++ *
++ * Protocol (all integers little endian)
++ *
++ *   driver -> server:  12 byte header + payload
++ *       u8  type   (1=MODE, 2=ROWS, 3=TITLE, 4=CLOSE, 5=CURSOR)
++ *       u8  flag
++ *       u16 a      MODE: width   ROWS: first row   CURSOR: visible
++ *       u16 b      MODE: height  ROWS: row count
++ *       u16 c      MODE: width of a row in pixels (= a)
++ *       u32 len    payload length in bytes
++ *     ROWS payload: b * width * 4 bytes, R G B X per pixel
++ *     TITLE payload: UTF-8/ASCII text
++ *
++ *   server -> driver:  fixed 12 byte messages
++ *       u8  type   (1=KEYDOWN, 2=KEYUP, 3=MOVE, 4=BUTTON, 5=WHEEL, 6=FOCUS, 7=CLOSE, 8=REDRAW)
++ *       u8  a      KEY*: scancode   BUTTON: FB button bit   FOCUS: 1/0   KEYDOWN: repeat flag in b
++ *       u8  b      BUTTON: pressed  KEYDOWN: repeat
++ *       u8  pad
++ *       i16 x, y   MOVE: position   WHEEL: x = vertical delta, y = horizontal delta
++ *       i32 key    KEYDOWN/KEYUP: ascii code or 0 (=> derive extended key from scancode)
++ */
++
++#include "../fb_gfx.h"
++
++#if defined HOST_LINUX || defined HOST_FREEBSD || defined HOST_OPENBSD || defined HOST_NETBSD || defined HOST_DRAGONFLY || defined HOST_DARWIN
++
++#include <pthread.h>
++#include <poll.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sys/time.h>
++#include <sys/socket.h>
++
++#define FBWEB_FPS            60
++#define FBWEB_DBLCLICK_MS    300
++#define SCREENLIST(w, h)     ((h) | (w) << 16)
++#define MSG_MODE             1
++#define MSG_ROWS             2
++#define MSG_TITLE            3
++#define MSG_CLOSE            4
++#define MSG_CURSOR           5
++
++#define IN_KEYDOWN           1
++#define IN_KEYUP             2
++#define IN_MOVE              3
++#define IN_BUTTON            4
++#define IN_WHEEL             5
++#define IN_FOCUS             6
++#define IN_CLOSE             7
++#define IN_REDRAW            8
++
++static int sock = -1;
++static int scr_w, scr_h;
++static unsigned char *cur_buf, *sent_buf;
++static BLITTER *blitter;
++static pthread_t thread;
++static pthread_mutex_t mutex;
++static pthread_once_t mutex_once = PTHREAD_ONCE_INIT;
++
++static void mutex_init(void)
++{
++	pthread_mutexattr_t attr;
++	pthread_mutexattr_init(&attr);
++	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
++	pthread_mutex_init(&mutex, &attr);
++	pthread_mutexattr_destroy(&attr);
++}
++static volatile int is_running = FALSE;
++static int has_focus, mouse_on, mouse_x, mouse_y, mouse_wheel, mouse_hwheel, mouse_buttons;
++static int force_full;
++static long long last_click_ms;
++static char title_buf[256];
++/* Keys stay "down" for MULTIKEY at least this long: over the network a short
++   press may arrive as key-down and key-up in the same packet. */
++#define FBWEB_MIN_HOLD_MS    50
++static long long key_down_ms[128], key_up_due[128];
++
++static long long now_ms(void)
++{
++	struct timeval tv;
++	gettimeofday(&tv, NULL);
++	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
++}
++
++static int write_all(const void *data, size_t len)
++{
++	const unsigned char *p = data;
++	while (len > 0) {
++		ssize_t n = send(sock, p, len, MSG_NOSIGNAL);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			if (errno == EAGAIN) {
++				struct pollfd pfd = { sock, POLLOUT, 0 };
++				poll(&pfd, 1, 100);
++				continue;
++			}
++			return -1;
++		}
++		p += n;
++		len -= n;
++	}
++	return 0;
++}
++
++static void put16(unsigned char *p, int v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
++static void put32(unsigned char *p, unsigned int v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
++
++static int send_msg(int type, int flag, int a, int b, int c, const void *payload, unsigned int len)
++{
++	unsigned char hdr[12];
++	hdr[0] = type; hdr[1] = flag;
++	put16(hdr + 2, a); put16(hdr + 4, b); put16(hdr + 6, c);
++	put32(hdr + 8, len);
++	if (sock < 0 || write_all(hdr, 12))
++		return -1;
++	if (len && write_all(payload, len))
++		return -1;
++	return 0;
++}
++
++/* blit dirty lines and send rows that actually changed */
++static void driver_update(void)
++{
++	int y, start, pitch = scr_w * 4;
++
++	if (!__fb_gfx || !__fb_gfx->framebuffer || !cur_buf)
++		return;
++
++	if (force_full)
++		fb_hMemSet(__fb_gfx->dirty, TRUE, __fb_gfx->h);
++
++	blitter(cur_buf, pitch);
++	fb_hMemSet(__fb_gfx->dirty, FALSE, __fb_gfx->h);
++
++	for (y = 0; y < scr_h; ) {
++		if (!force_full && !memcmp(cur_buf + y * pitch, sent_buf + y * pitch, pitch)) {
++			y++;
++			continue;
++		}
++		start = y;
++		while (y < scr_h && (force_full || memcmp(cur_buf + y * pitch, sent_buf + y * pitch, pitch)))
++			y++;
++		memcpy(sent_buf + start * pitch, cur_buf + start * pitch, (y - start) * pitch);
++		send_msg(MSG_ROWS, 0, start, y - start, scr_w, cur_buf + start * pitch, (y - start) * pitch);
++	}
++	force_full = FALSE;
++}
++
++static void post_mouse_event(int type)
++{
++	EVENT e;
++	fb_hMemSet(&e, 0, sizeof(e));
++	e.type = type;
++	fb_hPostEvent(&e);
++}
++
++static void handle_input(const unsigned char *m)
++{
++	EVENT e;
++	int type = m[0], a = m[1], b = m[2];
++	int x = (short)(m[4] | (m[5] << 8));
++	int y = (short)(m[6] | (m[7] << 8));
++	int key = (int)(m[8] | (m[9] << 8) | (m[10] << 16) | ((unsigned)m[11] << 24));
++	long long t;
++
++	fb_hMemSet(&e, 0, sizeof(e));
++
++	switch (type) {
++	case IN_KEYDOWN:
++		if (a > 0 && a < 128) {
++			__fb_gfx->key[a] = TRUE;
++			key_up_due[a] = 0;
++			if (!b)
++				key_down_ms[a] = now_ms();
++		}
++		if (!key)
++			key = fb_hScancodeToExtendedKey(a);
++		if (key)
++			fb_hPostKey(key);
++		e.type = b ? EVENT_KEY_REPEAT : EVENT_KEY_PRESS;
++		e.scancode = a;
++		e.ascii = ((key < 0) || (key > 0xFF)) ? 0 : key;
++		break;
++
++	case IN_KEYUP:
++		if (a > 0 && a < 128) {
++			t = now_ms();
++			if (t - key_down_ms[a] < FBWEB_MIN_HOLD_MS)
++				key_up_due[a] = key_down_ms[a] + FBWEB_MIN_HOLD_MS;
++			else
++				__fb_gfx->key[a] = FALSE;
++		}
++		e.type = EVENT_KEY_RELEASE;
++		e.scancode = a;
++		e.ascii = ((key <= 0) || (key > 0xFF)) ? 0 : key;
++		break;
++
++	case IN_MOVE:
++		if (!mouse_on) {
++			mouse_on = TRUE;
++			post_mouse_event(EVENT_MOUSE_ENTER);
++		}
++		e.type = EVENT_MOUSE_MOVE;
++		e.dx = x - mouse_x;
++		e.dy = y - mouse_y;
++		mouse_x = x;
++		mouse_y = y;
++		e.x = x;
++		e.y = y;
++		if (__fb_gfx->scanline_size != 1) {
++			e.y /= __fb_gfx->scanline_size;
++			e.dy /= __fb_gfx->scanline_size;
++		}
++		break;
++
++	case IN_BUTTON:
++		if (b) {
++			mouse_buttons |= a;
++			e.type = EVENT_MOUSE_BUTTON_PRESS;
++			t = now_ms();
++			if (t - last_click_ms < FBWEB_DBLCLICK_MS)
++				e.type = EVENT_MOUSE_DOUBLE_CLICK;
++			last_click_ms = t;
++		} else {
++			mouse_buttons &= ~a;
++			e.type = EVENT_MOUSE_BUTTON_RELEASE;
++		}
++		e.button = a;
++		break;
++
++	case IN_WHEEL:
++		if (x) {
++			mouse_wheel += x;
++			e.type = EVENT_MOUSE_WHEEL;
++			e.z = mouse_wheel;
++		} else if (y) {
++			mouse_hwheel += y;
++			e.type = EVENT_MOUSE_HWHEEL;
++			e.w = mouse_hwheel;
++		}
++		break;
++
++	case IN_FOCUS:
++		if (a) {
++			has_focus = TRUE;
++			e.type = EVENT_WINDOW_GOT_FOCUS;
++		} else {
++			has_focus = FALSE;
++			fb_hMemSet(__fb_gfx->key, FALSE, 128);
++			memset(key_up_due, 0, sizeof(key_up_due));
++			if (mouse_on) {
++				mouse_on = FALSE;
++				post_mouse_event(EVENT_MOUSE_EXIT);
++			}
++			mouse_buttons = 0;
++			e.type = EVENT_WINDOW_LOST_FOCUS;
++		}
++		break;
++
++	case IN_CLOSE:
++		fb_hPostKey(KEY_QUIT);
++		e.type = EVENT_WINDOW_CLOSE;
++		break;
++
++	case IN_REDRAW:
++		force_full = TRUE;
++		break;
++	}
++
++	if (e.type)
++		fb_hPostEvent(&e);
++}
++
++static void *driver_thread(void *arg)
++{
++	unsigned char in[12];
++	int have = 0;
++	long long next = now_ms();
++	(void)arg;
++
++	while (is_running) {
++		long long t = now_ms();
++		int wait = (int)(next - t), i;
++		struct pollfd pfd = { sock, POLLIN, 0 };
++
++		/* deferred key releases (see FBWEB_MIN_HOLD_MS) */
++		for (i = 1; i < 128; i++) {
++			if (key_up_due[i]) {
++				if (t >= key_up_due[i]) {
++					__fb_gfx->key[i] = FALSE;
++					key_up_due[i] = 0;
++				} else if (key_up_due[i] - t < wait) {
++					wait = (int)(key_up_due[i] - t);
++				}
++			}
++		}
++		if (wait < 0)
++			wait = 0;
++		if (poll(&pfd, 1, wait) > 0) {
++			if (pfd.revents & (POLLHUP | POLLERR)) {
++				/* server is gone: behave like a closed window */
++				fb_hPostKey(KEY_QUIT);
++				is_running = FALSE;
++				break;
++			}
++			if (pfd.revents & POLLIN) {
++				ssize_t n = recv(sock, in + have, sizeof(in) - have, MSG_DONTWAIT);
++				if (n == 0) {
++					fb_hPostKey(KEY_QUIT);
++					is_running = FALSE;
++					break;
++				}
++				if (n > 0) {
++					have += n;
++					if (have == sizeof(in)) {
++						handle_input(in);
++						have = 0;
++					}
++				}
++			}
++		}
++
++		if (now_ms() >= next) {
++			/* while the program holds SCREENLOCK we just try again a bit later */
++			if (pthread_mutex_trylock(&mutex) == 0) {
++				driver_update();
++				pthread_mutex_unlock(&mutex);
++				next = now_ms() + 1000 / FBWEB_FPS;
++			} else {
++				next = now_ms() + 2;
++			}
++		}
++	}
++	return NULL;
++}
++
++static void driver_exit(void);
++
++static int driver_init(char *title, int w, int h, int depth, int refresh_rate, int flags)
++{
++	const char *env = getenv("FBWEB_GFX_FD");
++	(void)depth; (void)refresh_rate;
++
++	if (!env || !*env)
++		return -1;
++	if (flags & DRIVER_OPENGL)
++		return -1;
++
++	sock = atoi(env);
++	if (sock < 0)
++		return -1;
++	pthread_once(&mutex_once, mutex_init);
++
++	scr_w = w;
++	scr_h = h;
++	cur_buf = calloc(1, (size_t)w * h * 4);
++	sent_buf = calloc(1, (size_t)w * h * 4);
++	blitter = fb_hGetBlitter(32, TRUE);   /* R G B X byte order, as needed by <canvas> */
++	if (!cur_buf || !sent_buf || !blitter) {
++		driver_exit();
++		return -1;
++	}
++
++	has_focus = TRUE;
++	mouse_on = FALSE;
++	mouse_x = mouse_y = 0;
++	mouse_buttons = 0;
++	mouse_wheel = mouse_hwheel = 0;
++	force_full = TRUE;
++	__fb_gfx->refresh_rate = FBWEB_FPS;
++
++	if (send_msg(MSG_MODE, 0, w, h, w, NULL, 0)) {
++		driver_exit();
++		return -1;
++	}
++	if (title) {
++		strncpy(title_buf, title, sizeof(title_buf) - 1);
++		send_msg(MSG_TITLE, 0, 0, 0, 0, title_buf, strlen(title_buf));
++	}
++
++	is_running = TRUE;
++	if (pthread_create(&thread, NULL, driver_thread, NULL)) {
++		is_running = FALSE;
++		driver_exit();
++		return -1;
++	}
++	return 0;
++}
++
++static void driver_exit(void)
++{
++	if (is_running) {
++		is_running = FALSE;
++		pthread_join(thread, NULL);
++	}
++	if (sock >= 0 && cur_buf) {
++		/* send the final picture, then announce that the window is gone */
++		pthread_mutex_lock(&mutex);
++		if (__fb_gfx && __fb_gfx->framebuffer)
++			driver_update();
++		pthread_mutex_unlock(&mutex);
++		send_msg(MSG_CLOSE, 0, 0, 0, 0, NULL, 0);
++	}
++	free(cur_buf);
++	free(sent_buf);
++	cur_buf = sent_buf = NULL;
++	/* the socket stays open: a later SCREEN call may re-initialize the driver */
++}
++
++static void driver_lock(void)
++{
++	pthread_mutex_lock(&mutex);
++}
++
++static void driver_unlock(void)
++{
++	pthread_mutex_unlock(&mutex);
++}
++
++static void driver_set_palette(int index, int r, int g, int b)
++{
++	(void)index; (void)r; (void)g; (void)b;
++	/* the blitter reads the device palette; repaint everything on next update */
++	force_full = TRUE;
++}
++
++static void driver_wait_vsync(void)
++{
++	usleep(1000000 / FBWEB_FPS);
++}
++
++static int driver_get_mouse(int *x, int *y, int *z, int *buttons, int *clip)
++{
++	if (!mouse_on || !has_focus)
++		return -1;
++	*x = mouse_x;
++	*y = mouse_y;
++	*z = mouse_wheel;
++	*buttons = mouse_buttons;
++	*clip = 0;
++	return 0;
++}
++
++static void driver_set_mouse(int x, int y, int cursor, int clip)
++{
++	(void)clip;
++	if (x >= 0 && x < scr_w)
++		mouse_x = x;
++	if (y >= 0 && y < scr_h)
++		mouse_y = y;
++	if (cursor >= 0)
++		send_msg(MSG_CURSOR, 0, cursor > 0, 0, 0, NULL, 0);
++}
++
++static void driver_set_window_title(char *title)
++{
++	if (!title)
++		return;
++	strncpy(title_buf, title, sizeof(title_buf) - 1);
++	title_buf[sizeof(title_buf) - 1] = 0;
++	pthread_mutex_lock(&mutex);
++	send_msg(MSG_TITLE, 0, 0, 0, 0, title_buf, strlen(title_buf));
++	pthread_mutex_unlock(&mutex);
++}
++
++static int driver_set_window_pos(int x, int y)
++{
++	(void)x; (void)y;
++	return 0;
++}
++
++static int modes[] = {
++	SCREENLIST(1280, 1024), SCREENLIST(1280, 960), SCREENLIST(1280, 800), SCREENLIST(1280, 720),
++	SCREENLIST(1024, 768), SCREENLIST(800, 600), SCREENLIST(640, 480), SCREENLIST(640, 400),
++	SCREENLIST(640, 350), SCREENLIST(640, 200), SCREENLIST(320, 240), SCREENLIST(320, 200)
++};
++
++static int *driver_fetch_modes(int depth, int *size)
++{
++	(void)depth;
++	*size = sizeof(modes) / sizeof(int);
++	return memcpy(malloc(sizeof(modes)), modes, sizeof(modes));
++}
++
++int fb_hFBWebScreenInfo(ssize_t *width, ssize_t *height, ssize_t *depth, ssize_t *refresh)
++{
++	const char *env = getenv("FBWEB_GFX_FD");
++	if (!env || !*env)
++		return -1;
++	*width = 1280;
++	*height = 1024;
++	*depth = 32;
++	*refresh = FBWEB_FPS;
++	return 0;
++}
++
++const GFXDRIVER fb_gfxDriverFBWeb =
++{
++	"FBWeb",                 /* char *name; */
++	driver_init,             /* int (*init)(...); */
++	driver_exit,             /* void (*exit)(void); */
++	driver_lock,             /* void (*lock)(void); */
++	driver_unlock,           /* void (*unlock)(void); */
++	driver_set_palette,      /* void (*set_palette)(int index, int r, int g, int b); */
++	driver_wait_vsync,       /* void (*wait_vsync)(void); */
++	driver_get_mouse,        /* int (*get_mouse)(...); */
++	driver_set_mouse,        /* void (*set_mouse)(...); */
++	driver_set_window_title, /* void (*set_window_title)(char *title); */
++	driver_set_window_pos,   /* int (*set_window_pos)(int x, int y); */
++	driver_fetch_modes,      /* int *(*fetch_modes)(int depth, int *size); */
++	NULL,                    /* void (*flip)(void); */
++	NULL,                    /* void (*poll_events)(void); */
++	NULL                     /* void (*update)(void); */
++};
++
++#endif
+diff -ruN a/src/gfxlib2/unix/gfx_unix.c b/src/gfxlib2/unix/gfx_unix.c
+--- a/src/gfxlib2/unix/gfx_unix.c	2026-11-13 20:47:56.039531485 +0100
++++ b/src/gfxlib2/unix/gfx_unix.c	2026-11-13 20:47:56.039531485 +0100
+@@ -7,8 +7,14 @@
+ 
+ #if defined HOST_FREEBSD || defined HOST_OPENBSD || defined HOST_LINUX || defined HOST_DARWIN || defined HOST_SOLARIS || defined HOST_DRAGONFLY || defined HOST_NETBSD
+ 
++extern const GFXDRIVER fb_gfxDriverFBWeb;
++extern int fb_hFBWebScreenInfo(ssize_t *width, ssize_t *height, ssize_t *depth, ssize_t *refresh);
++
+ const GFXDRIVER *__fb_gfx_drivers_list[] = {
+ 
++	/* FBWeb: only active when FBWEB_GFX_FD is set, otherwise init fails */
++	&fb_gfxDriverFBWeb,
++
+ #ifndef DISABLE_X11
+ 	&fb_gfxDriverX11,
+ #ifndef DISABLE_OPENGL
+@@ -25,6 +31,8 @@
+ 
+ void fb_hScreenInfo(ssize_t *width, ssize_t *height, ssize_t *depth, ssize_t *refresh)
+ {
++	if (fb_hFBWebScreenInfo(width, height, depth, refresh) == 0)
++		return;
+ #ifndef DISABLE_X11
+ 	if (fb_hX11ScreenInfo(width, height, depth, refresh))
+ #endif
+diff -ruN a/src/rtlib/unix/hinit.c b/src/rtlib/unix/hinit.c
+--- a/src/rtlib/unix/hinit.c	2026-11-13 20:47:56.039531485 +0100
++++ b/src/rtlib/unix/hinit.c	2026-11-13 20:47:56.043531522 +0100
+@@ -121,6 +121,18 @@
+    extended to support more). */
+ static int fb_hTermQuery( int code, int *val1, int *val2 )
+ {
++	/* FBWeb: the browser console is driven by FB itself, so FB's own cursor
++	   bookkeeping is exact.  Querying the terminal would mix the reply with
++	   fast typed / pasted input (stdio buffering in getchar/scanf vs. raw
++	   reads elsewhere), which can lose keys or hang.  Skip the query. */
++	static int fbweb = -1;
++	if( fbweb < 0 ) {
++		const char *e = getenv( "FBWEB_CONSOLE" );
++		fbweb = (e && *e && *e != '0');
++	}
++	if( fbweb )
++		return FALSE;
++
+ 	if( fb_hTermOut( code, 0, 0 ) == FALSE )
+ 		return FALSE;
+ 
+@@ -382,6 +394,11 @@
+ 		__fb_con.f_in = fopen("/dev/tty", "r+b");
+ 		if (!__fb_con.f_in)
+ 			return -1;
++		/* Unbuffered: otherwise fgetc() may pull several typed/pasted keys
++		   into the stdio buffer, while key availability is later checked on
++		   the raw file descriptor -> keys appear "stuck" until the next key
++		   press.  (Found while building FBWeb.) */
++		setvbuf(__fb_con.f_in, NULL, _IONBF, 0);
+ 		__fb_con.h_in = fileno(__fb_con.f_in);
+ 	}
+ 	
+diff -ruN a/src/rtlib/unix/io_inkey.c b/src/rtlib/unix/io_inkey.c
+--- a/src/rtlib/unix/io_inkey.c	2026-11-13 20:47:56.043531522 +0100
++++ b/src/rtlib/unix/io_inkey.c	2026-11-13 20:47:56.043531522 +0100
+@@ -281,7 +281,11 @@
+ 		return feof(stdin) ? FALSE : TRUE;
+ 
+ 	fb_hGetCh(FALSE);
+-	result = key_buffer_changed;
++	/* Also report keys that are still waiting in the buffer: with fast typed
++	   or pasted input several keys can be buffered at once, and only checking
++	   key_buffer_changed left them stuck until the next key press.
++	   (Fix made for FBWeb.) */
++	result = key_buffer_changed || (key_head != key_tail);
+ 	key_buffer_changed = FALSE;
+ 	return result;
+ }

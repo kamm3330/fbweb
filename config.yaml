@@ -1,0 +1,57 @@
+# ============================================================
+#  FBWeb – FreeBASIC Web-IDE – Konfiguration
+#  Nach Änderungen:  systemctl restart fbweb
+# ============================================================
+
+server:
+  host: 0.0.0.0          # 0.0.0.0 = im ganzen LAN erreichbar, 127.0.0.1 = nur lokal
+  port: 8090
+  user: fb               # Benutzername für die Anmeldung (nur wenn password gesetzt)
+  password: ""           # leer = keine Anmeldung nötig
+
+# ------------------------------------------------------------
+#  Laufwerke
+#  Jedes Laufwerk erscheint links im Dateibrowser.
+#  Im laufenden FreeBASIC-Programm ist es unter /mnt/<name> erreichbar.
+#  Das Arbeitsverzeichnis (CURDIR) ist immer der Ordner der .bas-Datei,
+#  d.h.  OPEN "daten.txt" FOR OUTPUT AS #1  landet neben dem Programm.
+# ------------------------------------------------------------
+drives:
+  - name: lokal
+    type: local
+    path: /srv/fbweb/work
+
+  # Beispiel für eine sshfs-Freigabe (enabled: true zum Aktivieren).
+  # Voraussetzung: SSH-Schlüssel ohne Passphrase für root, z.B.:
+  #   ssh-keygen -t ed25519 -f /root/.ssh/fbweb_ed25519 -N ""
+  #   ssh-copy-id -i /root/.ssh/fbweb_ed25519.pub benutzer@192.168.0.10
+  - name: nas
+    type: sshfs
+    enabled: false
+    remote: benutzer@192.168.0.10:/home/benutzer/basic
+    port: 22
+    identity_file: /root/.ssh/fbweb_ed25519
+    mountpoint: /srv/fbweb/mnt/nas
+    options: []            # zusätzliche sshfs -o Optionen, z.B. [compression=yes]
+
+# ------------------------------------------------------------
+#  Kompilieren / Ausführen
+# ------------------------------------------------------------
+run:
+  user: fbrun            # Programme laufen als dieser Benutzer (nicht root)
+  sandbox: true          # bubblewrap: Programm sieht nur /usr und die Laufwerke
+  network: false         # Netzwerkzugriff für Programme erlauben?
+  timeout: 0             # max. Laufzeit in Sekunden, 0 = unbegrenzt
+  max_memory_mb: 1024    # Speichergrenze pro Programm, 0 = unbegrenzt
+  fbc: /usr/local/bin/fbc
+  fbc_options: []        # z.B. ["-lang", "qb"] oder ["-exx"] für Laufzeitprüfungen
+  build_dir: /var/tmp/fbweb
+
+# ------------------------------------------------------------
+#  Grafik (SCREEN / SCREENRES)
+#  Läuft über den eigenen gfxlib2-Treiber "FBWeb" (siehe fbsrc/),
+#  kein X-Server und kein VNC nötig.
+# ------------------------------------------------------------
+graphics:
+  fps: 30                # max. Bildrate zum Browser
+  compression: 1         # zlib-Stufe 1 (schnell) bis 9 (klein)

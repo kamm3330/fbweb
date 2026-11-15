@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FBWeb – FreeBASIC IDE</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%232f6fdf'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='bold' fill='white' text-anchor='middle'%3EFB%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/vendor/codemirror/lib/codemirror.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/addon/dialog/dialog.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/addon/hint/show-hint.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/addon/fold/foldgutter.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/addon/search/matchesonscrollbar.css">
+<link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header id="toolbar">
+  <button id="btnSidebar" class="icon" title="Dateispalte ein-/ausklappen (Strg+B)">☰</button>
+  <div class="brand"><span class="logo">FB</span>FBWeb</div>
+  <div class="group">
+    <button id="btnNew" title="Neue Datei (Strg+N)">Neu</button>
+    <button id="btnSave" title="Speichern (Strg+S)">Speichern</button>
+    <button id="btnSaveAs" title="Speichern unter … (Strg+Umschalt+S)">Speichern unter</button>
+  </div>
+  <div class="group">
+    <button id="btnRun" class="primary" title="Kompilieren und ausführen (F5)">▶ Ausführen</button>
+    <button id="btnStop" class="danger" title="Programm beenden (Umschalt+F5)" disabled>■ Stopp</button>
+  </div>
+  <div id="runState" class="state idle">bereit</div>
+  <div class="spacer"></div>
+  <div id="clock" title=""></div>
+  <div class="group">
+    <a id="lnkDocs" class="btnlink" href="https://www.freebasic.net/wiki/CatPgFullIndex" target="_blank" rel="noopener"
+       title="FreeBASIC-Befehlsreferenz (alle Befehle) in neuem Tab öffnen">📖 Befehle</a>
+    <button id="btnFind" title="Suchen (Strg+F) / Ersetzen (Strg+H)">Suchen</button>
+    <button id="btnFontMinus" title="Schrift kleiner">A−</button>
+    <button id="btnFontPlus" title="Schrift größer">A+</button>
+    <button id="btnTheme" title="Hell/Dunkel umschalten">◐</button>
+    <button id="btnHelp" title="Tastenkürzel und Hilfe">?</button>
+  </div>
+</header>
+
+<main id="layout">
+  <aside id="sidebar">
+    <div class="pane-head">
+      <span>Dateien</span>
+      <div class="mini">
+        <button id="fNewFile" title="Neue Datei im gewählten Ordner">+📄</button>
+        <button id="fNewDir" title="Neuer Ordner">+📁</button>
+        <button id="fRename" title="Umbenennen">✎</button>
+        <button id="fDelete" title="Löschen">🗑</button>
+        <button id="fUpload" title="Datei hochladen">⇧</button>
+        <button id="fDownload" title="Herunterladen">⇩</button>
+        <button id="fRefresh" title="Aktualisieren">⟳</button>
+      </div>
+    </div>
+    <div id="tree" tabindex="0"></div>
+    <input type="file" id="uploadInput" multiple hidden>
+  </aside>
+  <div class="splitter v" data-target="sidebar"></div>
+
+  <section id="editorCol">
+    <div id="tabs"></div>
+    <div id="editorWrap"></div>
+  </section>
+  <div class="splitter v" data-target="rightCol" data-invert="1"></div>
+
+  <section id="rightCol">
+    <div id="gfxPane">
+      <div class="pane-head">
+        <span>Grafik <span id="gfxTitle" class="muted"></span></span>
+        <div class="mini">
+          <select id="gfxZoom" title="Zoom">
+            <option value="auto">Auto</option>
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+            <option value="3">3×</option>
+            <option value="4">4×</option>
+          </select>
+          <button id="gfxFull" title="Vollbild">⛶</button>
+          <button id="gfxClose" title="Grafikfenster schließen (wie das X am Fenster)">✕</button>
+        </div>
+      </div>
+      <div id="gfxBody">
+        <div id="gfxPlaceholder">
+          <div class="big">🖥</div>
+          Kein Grafikfenster geöffnet.<br>
+          <span class="muted">Mit <code>SCREEN 12</code> oder <code>SCREENRES 640,480,32</code> öffnet sich hier die Grafikausgabe.</span>
+          <div id="gfxState" class="muted small"></div>
+        </div>
+        <canvas id="gfxCanvas" tabindex="0" hidden></canvas>
+      </div>
+    </div>
+    <div class="splitter h" data-target="gfxPane"></div>
+    <div id="bottomPane">
+      <div class="pane-head tabsel">
+        <div>
+          <button class="ptab active" data-panel="console">Konsole</button>
+          <button class="ptab" data-panel="messages">Meldungen <span id="msgCount" class="badge" hidden>0</span></button>
+        </div>
+        <div class="mini">
+          <button id="conClear" title="Konsole leeren">⌫</button>
+          <button id="conFull" title="Konsole im Vollbild (Esc beendet)">⛶</button>
+        </div>
+      </div>
+      <div id="console" class="panel"></div>
+      <div id="messages" class="panel" hidden><div class="muted pad">Noch nichts kompiliert.</div></div>
+    </div>
+  </section>
+</main>
+
+<footer id="statusbar">
+  <span id="sbPos">Z 1, S 1</span>
+  <span id="sbFile">–</span>
+  <span class="spacer"></span>
+  <span id="sbConn" class="conn">●</span>
+  <span id="sbInfo"></span>
+</footer>
+
+<div id="modal" hidden>
+  <div class="dialog">
+    <h3 id="mTitle"></h3>
+    <div id="mText"></div>
+    <input id="mInput" type="text" spellcheck="false">
+    <div class="buttons">
+      <button id="mCancel">Abbrechen</button>
+      <button id="mOk" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="helpModal" hidden>
+  <div class="dialog wide">
+    <h3>FBWeb – Hilfe</h3>
+    <table class="keys">
+      <tr><td>F5</td><td>Speichern, kompilieren und ausführen</td></tr>
+      <tr><td>Umschalt+F5</td><td>Programm beenden</td></tr>
+      <tr><td>Strg+S / Strg+Umschalt+S</td><td>Speichern / Speichern unter</td></tr>
+      <tr><td>Strg+N</td><td>Neue Datei</td></tr>
+      <tr><td>Strg+B</td><td>Dateispalte ein-/ausklappen</td></tr>
+      <tr><td>Strg+F / Strg+H</td><td>Suchen / Ersetzen</td></tr>
+      <tr><td>Strg+G</td><td>Gehe zu Zeile</td></tr>
+      <tr><td>Strg+Leertaste</td><td>Autovervollständigung</td></tr>
+      <tr><td>Strg+#  bzw. Strg+/</td><td>Zeilen ein-/auskommentieren</td></tr>
+      <tr><td>F1</td><td>FreeBASIC-Referenz zum Wort unter dem Cursor</td></tr>
+      <tr><td>Klick in die Grafik</td><td>Grafikfenster bekommt Tastatur und Maus (blauer Rahmen)</td></tr>
+      <tr><td>Klick in die Konsole</td><td>Tastatureingaben gehen an INPUT / INKEY des Konsolenprogramms</td></tr>
+    </table>
+    <p class="muted">Dateien: Das Arbeitsverzeichnis eines Programms ist der Ordner seiner .bas-Datei.
+      Andere Laufwerke sind im Programm unter <code>/mnt/&lt;name&gt;</code> erreichbar.
+      Konfiguration: <code>/etc/fbweb/config.yaml</code> (Paket) bzw. <code>config.yaml</code> im Programmordner</p>
+    <div class="buttons"><button id="helpClose" class="primary">Schließen</button></div>
+  </div>
+</div>
+
+<script src="/static/vendor/codemirror/lib/codemirror.js"></script>
+<script src="/static/vendor/codemirror/addon/edit/matchbrackets.js"></script>
+<script src="/static/vendor/codemirror/addon/edit/closebrackets.js"></script>
+<script src="/static/vendor/codemirror/addon/selection/active-line.js"></script>
+<script src="/static/vendor/codemirror/addon/search/searchcursor.js"></script>
+<script src="/static/vendor/codemirror/addon/search/search.js"></script>
+<script src="/static/vendor/codemirror/addon/search/jump-to-line.js"></script>
+<script src="/static/vendor/codemirror/addon/search/match-highlighter.js"></script>
+<script src="/static/vendor/codemirror/addon/scroll/annotatescrollbar.js"></script>
+<script src="/static/vendor/codemirror/addon/search/matchesonscrollbar.js"></script>
+<script src="/static/vendor/codemirror/addon/dialog/dialog.js"></script>
+<script src="/static/vendor/codemirror/addon/hint/show-hint.js"></script>
+<script src="/static/vendor/codemirror/addon/hint/anyword-hint.js"></script>
+<script src="/static/vendor/codemirror/addon/comment/comment.js"></script>
+<script src="/static/vendor/codemirror/addon/fold/foldcode.js"></script>
+<script src="/static/vendor/codemirror/addon/fold/foldgutter.js"></script>
+<script src="/static/vendor/codemirror/addon/fold/indent-fold.js"></script>
+<script src="/static/vendor/xterm/xterm.js"></script>
+<script src="/static/vendor/xterm/addon-fit.js"></script>
+<script src="/static/fb-mode.js"></script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

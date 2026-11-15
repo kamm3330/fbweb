@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+deb/build/
+deb/wheels/
+deb/*.deb
+fbsrc/FreeBASIC-*-source/
+fbsrc/src.tar.xz
+fbsrc/*.log
